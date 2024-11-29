@@ -9,9 +9,10 @@
 (define-constant ERR_UNAUTHORIZED_ACCESS (err u103))
 (define-constant ERR_INVALID_BRIDGE_STATUS (err u104))
 (define-constant ERR_TRANSFER_NOT_FOUND (err u105))
-(define-constant ERR_INVALID_CHAIN_ID (err u106))
+(define-constant ERR_INVALID_SOURCE_CHAIN (err u106))
 (define-constant ERR_BELOW_MINIMUM_AMOUNT (err u107))
 (define-constant ERR_DUPLICATE_CONFIRMATION (err u108))
+(define-constant ERR_INVALID_RELAYER (err u109))
 
 ;; Data Variables
 (define-data-var bridge-minimum-transfer-amount uint u1000000)
@@ -23,24 +24,24 @@
 (define-map user-token-balances principal uint)
 (define-map authorized-relayers principal bool)
 (define-map processed-transfer-records
-    {transaction-hash: (buff 32), source-chain-id: uint}
+    {tx-hash: (buff 32), origin-chain: uint}
     {
-        transfer-amount: uint,
-        recipient-address: principal,
-        transfer-status: (string-ascii 20),
-        relayer-confirmation-count: uint
+        amount: uint,
+        recipient: principal,
+        status: (string-ascii 20),
+        confirmations: uint
     }
 )
 
 (define-map active-transfer-requests
     uint
     {
-        transfer-amount: uint,
-        sender-address: principal,
-        recipient-address: principal,
-        origin-chain-id: uint,
-        destination-chain-id: uint,
-        transfer-status: (string-ascii 20)
+        amount: uint,
+        sender: principal,
+        recipient: principal,
+        source-chain: uint,
+        target-chain: uint,
+        status: (string-ascii 20)
     }
 )
 
@@ -49,205 +50,134 @@
     (is-eq tx-sender CONTRACT_OWNER)
 )
 
-(define-private (is-authorized-relayer (relayer-address principal))
-    (default-to false (map-get? authorized-relayers relayer-address))
+(define-private (validate-relayer (relayer principal))
+    (let ((is-authorized (default-to false (map-get? authorized-relayers relayer))))
+        (asserts! is-authorized ERR_INVALID_RELAYER)
+        (ok true)
+    )
 )
 
-(define-private (validate-transfer-parameters 
-    (transfer-amount uint) 
-    (recipient-address principal) 
-    (destination-chain-id uint)
+(define-private (validate-transfer-params 
+    (amount uint) 
+    (recipient principal) 
+    (target-chain uint)
 )
-    (and
-        (>= transfer-amount (var-get bridge-minimum-transfer-amount))
-        (is-some (map-get? user-token-balances tx-sender))
-        (>= (default-to u0 (map-get? user-token-balances tx-sender)) transfer-amount)
-        (> destination-chain-id u0)
+    (begin
+        (asserts! (>= amount (var-get bridge-minimum-transfer-amount)) 
+                 ERR_BELOW_MINIMUM_AMOUNT)
+        (asserts! (is-some (map-get? user-token-balances tx-sender))
+                 ERR_INSUFFICIENT_BALANCE)
+        (asserts! (>= (default-to u0 (map-get? user-token-balances tx-sender)) amount)
+                 ERR_INSUFFICIENT_BALANCE)
+        (asserts! (> target-chain u0) ERR_INVALID_SOURCE_CHAIN)
+        (ok true)
     )
 )
 
 ;; Public Functions
-(define-public (initialize-bridge)
+(define-public (register-relayer (relayer principal))
     (begin
         (asserts! (is-contract-owner) ERR_OWNER_ONLY)
-        (var-set bridge-operation-paused false)
-        (var-set total-transfer-count u0)
+        (try! (validate-relayer-address relayer))
+        (map-set authorized-relayers relayer true)
         (ok true)
     )
 )
 
-(define-public (pause-bridge-operations)
+(define-public (remove-relayer (relayer principal))
     (begin
         (asserts! (is-contract-owner) ERR_OWNER_ONLY)
-        (var-set bridge-operation-paused true)
+        (try! (validate-relayer-address relayer))
+        (map-delete authorized-relayers relayer)
         (ok true)
     )
 )
 
-(define-public (resume-bridge-operations)
+(define-private (validate-relayer-address (relayer principal))
     (begin
-        (asserts! (is-contract-owner) ERR_OWNER_ONLY)
-        (var-set bridge-operation-paused false)
+        (asserts! (not (is-eq relayer CONTRACT_OWNER)) ERR_INVALID_PARAMETERS)
         (ok true)
     )
 )
 
-(define-public (register-relayer (relayer-address principal))
-    (begin
-        (asserts! (is-contract-owner) ERR_OWNER_ONLY)
-        (map-set authorized-relayers relayer-address true)
-        (ok true)
-    )
-)
-
-(define-public (remove-relayer-authorization (relayer-address principal))
-    (begin
-        (asserts! (is-contract-owner) ERR_OWNER_ONLY)
-        (map-delete authorized-relayers relayer-address)
-        (ok true)
-    )
-)
-
-(define-public (initiate-cross-chain-transfer 
-    (transfer-amount uint)
-    (recipient-address principal)
-    (destination-chain-id uint)
+(define-public (initiate-transfer 
+    (amount uint)
+    (recipient principal)
+    (target-chain uint)
 )
     (let (
-        (sender-address tx-sender)
-        (transfer-request-id (var-get total-transfer-count))
+        (transfer-id (var-get total-transfer-count))
     )
-        (asserts! (not (var-get bridge-operation-paused)) ERR_INVALID_BRIDGE_STATUS)
-        (asserts! (validate-transfer-parameters transfer-amount recipient-address destination-chain-id) 
-                 ERR_INVALID_PARAMETERS)
+        (asserts! (not (var-get bridge-operation-paused)) 
+                 ERR_INVALID_BRIDGE_STATUS)
+        (try! (validate-transfer-params amount recipient target-chain))
         
-        ;; Update sender's balance
+        ;; Update sender balance
         (map-set user-token-balances 
-            sender-address 
-            (- (default-to u0 (map-get? user-token-balances sender-address)) transfer-amount)
+            tx-sender 
+            (- (default-to u0 (map-get? user-token-balances tx-sender)) amount)
         )
         
-        ;; Record transfer request
-        (map-set active-transfer-requests transfer-request-id {
-            transfer-amount: transfer-amount,
-            sender-address: sender-address,
-            recipient-address: recipient-address,
-            origin-chain-id: u1,  ;; Current chain ID
-            destination-chain-id: destination-chain-id,
-            transfer-status: "PENDING"
+        ;; Record transfer
+        (map-set active-transfer-requests transfer-id {
+            amount: amount,
+            sender: tx-sender,
+            recipient: recipient,
+            source-chain: u1,
+            target-chain: target-chain,
+            status: "PENDING"
         })
         
-        (var-set total-transfer-count (+ transfer-request-id u1))
-        (ok transfer-request-id)
+        (var-set total-transfer-count (+ transfer-id u1))
+        (ok transfer-id)
     )
 )
 
-(define-public (confirm-cross-chain-transfer 
-    (transfer-request-id uint)
-    (transaction-hash (buff 32))
+(define-public (confirm-transfer 
+    (transfer-id uint)
+    (tx-hash (buff 32))
 )
     (let (
-        (transfer-request (unwrap! (map-get? active-transfer-requests transfer-request-id) 
-                                 ERR_TRANSFER_NOT_FOUND))
-        (current-confirmation-count (default-to u0 
-            (get relayer-confirmation-count 
+        (transfer-data (unwrap! (map-get? active-transfer-requests transfer-id) 
+                               ERR_TRANSFER_NOT_FOUND))
+        (current-confirmations (default-to u0 
+            (get confirmations 
                 (map-get? processed-transfer-records 
                     {
-                        transaction-hash: transaction-hash,
-                        source-chain-id: (get destination-chain-id transfer-request)
+                        tx-hash: tx-hash,
+                        origin-chain: (get target-chain transfer-data)
                     }
                 )
             ))
         )
     )
-        (asserts! (is-authorized-relayer tx-sender) ERR_UNAUTHORIZED_ACCESS)
-        (asserts! (not (var-get bridge-operation-paused)) ERR_INVALID_BRIDGE_STATUS)
+        (try! (validate-relayer tx-sender))
+        (asserts! (not (var-get bridge-operation-paused)) 
+                 ERR_INVALID_BRIDGE_STATUS)
         
-        ;; Update transfer records
+        ;; Update records
         (map-set processed-transfer-records 
             {
-                transaction-hash: transaction-hash,
-                source-chain-id: (get destination-chain-id transfer-request)
+                tx-hash: tx-hash,
+                origin-chain: (get target-chain transfer-data)
             }
             {
-                transfer-amount: (get transfer-amount transfer-request),
-                recipient-address: (get recipient-address transfer-request),
-                transfer-status: "CONFIRMED",
-                relayer-confirmation-count: (+ current-confirmation-count u1)
+                amount: (get amount transfer-data),
+                recipient: (get recipient transfer-data),
+                status: "CONFIRMED",
+                confirmations: (+ current-confirmations u1)
             }
         )
         
-        ;; Check if enough confirmations received
-        (if (>= (+ current-confirmation-count u1) (var-get required-relayer-confirmations))
+        ;; Check confirmation threshold
+        (if (>= (+ current-confirmations u1) (var-get required-relayer-confirmations))
             (begin
-                (map-set active-transfer-requests transfer-request-id 
-                    (merge transfer-request {transfer-status: "COMPLETED"})
+                (map-set active-transfer-requests transfer-id 
+                    (merge transfer-data {status: "COMPLETED"})
                 )
                 (ok true)
             )
             (ok false)
         )
     )
-)
-
-(define-public (deposit-tokens)
-    (begin
-        (asserts! (> (stx-get-balance tx-sender) u0) ERR_INSUFFICIENT_BALANCE)
-        (map-set user-token-balances
-            tx-sender
-            (+ (default-to u0 (map-get? user-token-balances tx-sender)) (stx-get-balance tx-sender))
-        )
-        (ok true)
-    )
-)
-
-(define-public (withdraw-tokens (withdrawal-amount uint))
-    (let (
-        (current-token-balance (default-to u0 (map-get? user-token-balances tx-sender)))
-    )
-        (asserts! (>= current-token-balance withdrawal-amount) ERR_INSUFFICIENT_BALANCE)
-        (asserts! (not (var-get bridge-operation-paused)) ERR_INVALID_BRIDGE_STATUS)
-        
-        ;; Update balance
-        (map-set user-token-balances
-            tx-sender
-            (- current-token-balance withdrawal-amount)
-        )
-        
-        ;; Transfer STX
-        (try! (stx-transfer? withdrawal-amount tx-sender tx-sender))
-        (ok true)
-    )
-)
-
-;; Read-only Functions
-(define-read-only (get-user-balance (user-address principal))
-    (ok (default-to u0 (map-get? user-token-balances user-address)))
-)
-
-(define-read-only (get-transfer-request-details (transfer-request-id uint))
-    (ok (map-get? active-transfer-requests transfer-request-id))
-)
-
-(define-read-only (get-transfer-confirmation-count 
-    (transaction-hash (buff 32))
-    (chain-id uint)
-)
-    (ok (get relayer-confirmation-count 
-        (default-to 
-            {
-                transfer-amount: u0,
-                recipient-address: CONTRACT_OWNER,
-                transfer-status: "NONE",
-                relayer-confirmation-count: u0
-            }
-            (map-get? processed-transfer-records 
-                {transaction-hash: transaction-hash, source-chain-id: chain-id}
-            )
-        )
-    ))
-)
-
-(define-read-only (is-bridge-paused)
-    (ok (var-get bridge-operation-paused))
 )
